@@ -67,6 +67,7 @@ const routes = [
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
+  "POST /issues/migrate",
   "PATCH /issues/:id/status"
 ];
 
@@ -86,6 +87,14 @@ async function readDb() {
 
 async function writeDb(data) {
   await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+}
+
+// 串行化所有写请求，避免并发迁移时读-改-写交错导致更新丢失
+let mutationQueue = Promise.resolve();
+function enqueueMutation(task) {
+  const result = mutationQueue.then(task);
+  mutationQueue = result.catch(() => {});
+  return result;
 }
 
 function send(res, status, body) {
@@ -258,6 +267,33 @@ async function handle(req, res) {
     return send(res, 201, { data: issue });
   }
 
+  if (req.method === "POST" && pathname === "/issues/migrate") {
+    const body = await parseBody(req);
+    required(body, ["issueIds", "targetSectionId"]);
+    if (!Array.isArray(body.issueIds) || body.issueIds.length === 0) {
+      return send(res, 400, { error: "issueIds 必须是非空数组" });
+    }
+    const targetSection = db.sections.find((item) => item.id === body.targetSectionId);
+    if (!targetSection) return send(res, 404, { error: "目标区间不存在" });
+    const issueIds = [...new Set(body.issueIds)];
+    const issues = issueIds.map((id) => db.issues.find((item) => item.id === id));
+    const missingIndex = issues.findIndex((item) => !item);
+    if (missingIndex !== -1) return send(res, 404, { error: `问题不存在：${issueIds[missingIndex]}` });
+    if (issues.some((item) => item.tuneId !== targetSection.tuneId)) {
+      return send(res, 400, { error: "一次只能迁移同一曲目内的问题" });
+    }
+    const outOfRange = issues.filter(
+      (item) => !Number.isFinite(item.beat) || item.beat < targetSection.startBeat || item.beat > targetSection.endBeat
+    );
+    if (outOfRange.length) {
+      return send(res, 400, { error: `问题拍号不在目标区间范围内：${outOfRange.map((item) => item.id).join(", ")}` });
+    }
+    for (const issue of issues) issue.sectionId = targetSection.id;
+    targetSection.checked = false;
+    await writeDb(db);
+    return send(res, 200, { data: { issues, targetSection } });
+  }
+
   const issueStatusMatch = pathname.match(/^\/issues\/([^/]+)\/status$/);
   if (issueStatusMatch && req.method === "PATCH") {
     const issue = db.issues.find((item) => item.id === issueStatusMatch[1]);
@@ -275,7 +311,10 @@ async function handle(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  const run = () =>
+    handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  if (req.method === "POST" || req.method === "PATCH") return enqueueMutation(run);
+  return run();
 });
 
 server.listen(PORT, () => {
